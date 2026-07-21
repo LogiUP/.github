@@ -1,0 +1,17 @@
+name: Notify Lark on pull requests
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+permissions: {}
+
+jobs:
+  notify:
+    uses: LogiUP/.github/.github/workflows/lark-pr-notify-reusable.yml@8f1349ac38a47b2fd7c10daebaaa676402d0d299
+    secrets:
+      lark_webhook_url: ${{ secrets.LOGIUP_LARK_PR_WEBHOOK_URL }}
+      lark_bot_secret: ${{ secrets.LOGIUP_LARK_PR_BOT_SECRET }}
