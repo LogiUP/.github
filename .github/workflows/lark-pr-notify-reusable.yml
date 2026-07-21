@@ -1,0 +1,145 @@
+name: Lark PR notification (reusable)
+
+on:
+  workflow_call:
+    secrets:
+      lark_webhook_url:
+        required: true
+      lark_bot_secret:
+        required: true
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Send PR event to Lark
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send Lark card
+        shell: bash
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.lark_webhook_url }}
+          LARK_BOT_SECRET: ${{ secrets.lark_bot_secret }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+
+          case "${PR_ACTION}" in
+            opened)
+              EVENT_LABEL="Pull request opened"
+              HEADER_TEMPLATE="blue"
+              ;;
+            reopened)
+              EVENT_LABEL="Pull request reopened"
+              HEADER_TEMPLATE="orange"
+              ;;
+            ready_for_review)
+              EVENT_LABEL="Pull request ready for review"
+              HEADER_TEMPLATE="green"
+              ;;
+            *)
+              echo "Unsupported pull request action: ${PR_ACTION}"
+              exit 0
+              ;;
+          esac
+
+          if [[ "${PR_DRAFT}" == "true" ]]; then
+            PR_STATUS="Draft"
+          else
+            PR_STATUS="Ready for review"
+          fi
+
+          DETAILS=$(printf '%s\n\n%s #%s\n%s\n\nAuthor: %s\nBranches: %s -> %s\nStatus: %s' \
+            "${EVENT_LABEL}" \
+            "${REPOSITORY}" \
+            "${PR_NUMBER}" \
+            "${PR_TITLE}" \
+            "${PR_AUTHOR}" \
+            "${PR_HEAD}" \
+            "${PR_BASE}" \
+            "${PR_STATUS}")
+
+          TIMESTAMP=$(date +%s)
+          SIGN=$(LARK_TIMESTAMP="${TIMESTAMP}" LARK_SECRET="${LARK_BOT_SECRET}" python3 -c '
+          import base64
+          import hashlib
+          import hmac
+          import os
+
+          value = (os.environ["LARK_TIMESTAMP"] + "\n" + os.environ["LARK_SECRET"]).encode("utf-8")
+          print(base64.b64encode(hmac.new(value, digestmod=hashlib.sha256).digest()).decode("utf-8"), end="")
+          ')
+
+          PAYLOAD=$(jq -n \
+            --arg timestamp "${TIMESTAMP}" \
+            --arg sign "${SIGN}" \
+            --arg title "${EVENT_LABEL}" \
+            --arg template "${HEADER_TEMPLATE}" \
+            --arg details "${DETAILS}" \
+            --arg repository "${REPOSITORY}" \
+            --arg pr_url "${PR_URL}" \
+            '{
+              timestamp: $timestamp,
+              sign: $sign,
+              msg_type: "interactive",
+              card: {
+                config: {wide_screen_mode: true},
+                header: {
+                  title: {tag: "plain_text", content: $title},
+                  template: $template
+                },
+                elements: [
+                  {tag: "div", text: {tag: "plain_text", content: $details}},
+                  {tag: "hr"},
+                  {
+                    tag: "action",
+                    actions: [
+                      {
+                        tag: "button",
+                        text: {tag: "plain_text", content: "Open pull request"},
+                        url: $pr_url,
+                        type: "primary"
+                      }
+                    ]
+                  },
+                  {tag: "note", elements: [{tag: "plain_text", content: $repository}]}
+                ]
+              }
+            }')
+
+          RESPONSE_FILE=$(mktemp)
+          trap 'rm -f "${RESPONSE_FILE}"' EXIT
+
+          HTTP_CODE=$(curl \
+            --silent \
+            --show-error \
+            --connect-timeout 10 \
+            --max-time 20 \
+            --output "${RESPONSE_FILE}" \
+            --write-out '%{http_code}' \
+            --header 'Content-Type: application/json' \
+            --data-binary "${PAYLOAD}" \
+            "${LARK_WEBHOOK_URL}")
+
+          if [[ "${HTTP_CODE}" != "200" ]]; then
+            echo "::error::Lark webhook returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+          LARK_CODE=$(jq -r '.code // -1' "${RESPONSE_FILE}")
+          if [[ "${LARK_CODE}" != "0" ]]; then
+            LARK_MESSAGE=$(jq -r '.msg // "unknown Lark error"' "${RESPONSE_FILE}")
+            echo "::error::Lark webhook rejected the notification (code=${LARK_CODE}, message=${LARK_MESSAGE})"
+            exit 1
+          fi
+
+          echo "Lark PR notification sent"
